@@ -1,9 +1,0 @@
-version: "1.0"
-name: "update-manager"
-type: "sw.block"
-description: "Block para gestionar update locks y desbloqueo seguro en balena"
-assets:
-  repository:
-    type: "blob.asset"
-    data:
-      url: "https://github.com/tu-org/update-manager-block"
