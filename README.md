@@ -4,10 +4,11 @@ Este servicio expone una API HTTP para gestionar el bloqueo y desbloqueo de actu
 
 ## Requisitos
 
-- ROS 2 instalado y configurado
+- ROS 2 instalado y configurado (incluye las dependencias Python de ROS 2 como `rclpy` y `std_msgs`)
 - Python 3
-- Dependencias Python instaladas
+- Dependencias Python vía `pip` instaladas (ver `requirements.txt`)
 - Variable de entorno `UNLOCK_TOKEN` definida
+> Nota: las dependencias específicas de ROS 2 (`rclpy`, `std_msgs`, etc.) se instalan junto con ROS 2 y se exponen al ejecutar `source /opt/ros/<distro>/setup.bash`. No se recomienda intentar instalarlas con `pip`.
 
 ## Preparación del entorno
 

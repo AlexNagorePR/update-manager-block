@@ -26,6 +26,8 @@ running = threading.Event()
 running.set()
 robot_state = -1
 
+logger = logging.getLogger(__name__)
+
 class StateListener(Node):
     def __init__(self):
         super().__init__("state_listener")
@@ -39,7 +41,7 @@ class StateListener(Node):
     def listener_callback(self, msg: UInt16):
         global robot_state
         robot_state = msg.data
-        logging.info("Estado del robot actualizado: %s", robot_state)
+        logger.info("Estado del robot actualizado: %s", robot_state)
 
 def start_ros2_listener():
     rclpy.init()
@@ -51,28 +53,28 @@ def start_ros2_listener():
 
     ros_thread = threading.Thread(target=spin_ros2, daemon=True)
     ros_thread.start()
-    logging.info("ROS2 listener iniciado")
-    return node
+    logger.info("ROS2 listener iniciado")
+    return node, ros_thread
 
 def acquire_lock() -> bool:
     with state_lock:
         try:
             lock.acquire(timeout=0)
-            logging.info("Lock adquirido en %s", LOCK_PATH)
+            logger.info("Lock adquirido en %s", LOCK_PATH)
             return True
         except AlreadyLocked:
-            logging.info("El lock ya está adquirido")
+            logger.info("El lock ya está adquirido")
             return False
 
 def release_lock() -> None:
     with state_lock:
         try:
             lock.break_lock()
-            logging.info("Lock liberado")
+            logger.info("Lock liberado")
         except NotLocked:
-            logging.warning("El lock ya estaba liberado")
+            logger.warning("El lock ya estaba liberado")
         except NotMyLock:
-            logging.warning("El lock no fue adquirido por este proceso")
+            logger.warning("El lock no fue adquirido por este proceso")
 
 def is_locked() -> bool:
     with state_lock:
@@ -132,19 +134,21 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self._send_json(200, { "ok": True, "locked": True })
             except Exception as exc:
-                logging.exception("Error adquiriendo lock %s", exc)
+                logger.exception("Error adquiriendo lock %s", exc)
                 self._send_json(500, { "ok": False, "error": str(exc) })
             return
         
         self._send_json(404, { "error": "not_found" })
 
     def log_message(self, format, *args):
-        logging.info("HTTP %s", format % args)
+        # Suppress default BaseHTTPRequestHandler logging - use our own logger instead
+        request_info = format % args
+        logger.debug("HTTP: %s", request_info)
 
 def serve_http() -> None:
     server = HTTPServer(("0.0.0.0", PORT), Handler)
     server.timeout=1
-    logging.info("Servidor HTTP escuchando en puerto %s", PORT)
+    logger.info("Servidor HTTP escuchando en puerto %s", PORT)
 
     try:
         while running.is_set():
@@ -153,31 +157,35 @@ def serve_http() -> None:
         server.server_close()
 
 def handle_signal(signum, frame) -> None:
-    logging.info("Señal recibida, cerrando update-manager")
+    logger.info("Señal recibida, cerrando update-manager")
     running.clear()
 
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    logging.info("Arrancando update-manager")
+    logger.info("Arrancando update-manager")
 
-    ros2_node = start_ros2_listener()
+    ros2_node, ros2_thread = start_ros2_listener()
 
     acquire_lock()
-    logging.info("Sistema bloqueado al arrancar")
+    logger.info("Sistema bloqueado al arrancar")
     
     try:
         serve_http()
     finally:
         release_lock()
+        running.clear()
+        ros2_thread.join(timeout=5)
+        ros2_node.destroy_node()
         rclpy.shutdown()
-        logging.info("Proceso finalizado")
+        logger.info("Proceso finalizado")
 
 if __name__ == "__main__":
     main()
