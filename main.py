@@ -12,8 +12,11 @@ import rclpy
 from rclpy.node import Node
 
 LOCK_PATH = "/tmp/balena/updates"
-PORT = int(os.getenv("PORT", "8080"))
+PORT = int(os.getenv("PORT", "80"))
 UNLOCK_TOKEN = os.getenv("UNLOCK_TOKEN")
+SAVE_UPDATE_STATES = {
+    int(x) for x in os.getenv("SAVE_UPDATE_STATES", "").split(",") if x
+    }
 
 if not UNLOCK_TOKEN:
     raise RuntimeError("UNLOCK_TOKEN no está definido")
@@ -41,7 +44,7 @@ class StateListener(Node):
     def listener_callback(self, msg: UInt16):
         global robot_state
         robot_state = msg.data
-        logger.info("Estado del robot actualizado: %s", robot_state)
+        logging.info("Estado del robot actualizado: %s", robot_state)
 
 def start_ros2_listener():
     rclpy.init()
@@ -53,28 +56,28 @@ def start_ros2_listener():
 
     ros_thread = threading.Thread(target=spin_ros2, daemon=True)
     ros_thread.start()
-    logger.info("ROS2 listener iniciado")
+    logging.info("ROS2 listener iniciado")
     return node, ros_thread
 
 def acquire_lock() -> bool:
     with state_lock:
         try:
             lock.acquire(timeout=0)
-            logger.info("Lock adquirido en %s", LOCK_PATH)
+            logging.info("Lock adquirido en %s", LOCK_PATH)
             return True
         except AlreadyLocked:
-            logger.info("El lock ya está adquirido")
+            logging.info("El lock ya está adquirido")
             return False
 
 def release_lock() -> None:
     with state_lock:
         try:
             lock.break_lock()
-            logger.info("Lock liberado")
+            logging.info("Lock liberado")
         except NotLocked:
-            logger.warning("El lock ya estaba liberado")
+            logging.warning("El lock ya estaba liberado")
         except NotMyLock:
-            logger.warning("El lock no fue adquirido por este proceso")
+            logging.warning("El lock no fue adquirido por este proceso")
 
 def is_locked() -> bool:
     with state_lock:
@@ -82,7 +85,7 @@ def is_locked() -> bool:
 
 def is_manual_mode() -> bool:
     with state_lock:
-        return robot_state == 5
+        return robot_state in SAVE_UPDATE_STATES
         
 def check_token(handler: BaseHTTPRequestHandler) -> bool:
     expected = f"Bearer {UNLOCK_TOKEN}"
@@ -134,21 +137,20 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self._send_json(200, { "ok": True, "locked": True })
             except Exception as exc:
-                logger.exception("Error adquiriendo lock %s", exc)
+                logging.exception("Error adquiriendo lock %s", exc)
                 self._send_json(500, { "ok": False, "error": str(exc) })
             return
         
         self._send_json(404, { "error": "not_found" })
 
     def log_message(self, format, *args):
-        # Suppress default BaseHTTPRequestHandler logging - use our own logger instead
         request_info = format % args
-        logger.debug("HTTP: %s", request_info)
+        logging.debug("HTTP: %s", request_info)
 
 def serve_http() -> None:
     server = HTTPServer(("0.0.0.0", PORT), Handler)
     server.timeout=1
-    logger.info("Servidor HTTP escuchando en puerto %s", PORT)
+    logging.info("Servidor HTTP escuchando en puerto %s", PORT)
 
     try:
         while running.is_set():
@@ -157,25 +159,28 @@ def serve_http() -> None:
         server.server_close()
 
 def handle_signal(signum, frame) -> None:
-    logger.info("Señal recibida, cerrando update-manager")
+    logging.info("Señal recibida, cerrando update-manager")
     running.clear()
 
 def main() -> None:
+    import sys
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stdout,
+        force=True,
     )
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    logger.info("Arrancando update-manager")
+    logging.info("Arrancando update-manager")
 
     ros2_node, ros2_thread = start_ros2_listener()
 
     acquire_lock()
-    logger.info("Sistema bloqueado al arrancar")
+    logging.info("Sistema bloqueado al arrancar")
     
     try:
         serve_http()
@@ -185,7 +190,7 @@ def main() -> None:
         ros2_thread.join(timeout=5)
         ros2_node.destroy_node()
         rclpy.shutdown()
-        logger.info("Proceso finalizado")
+        logging.info("Proceso finalizado")
 
 if __name__ == "__main__":
     main()
