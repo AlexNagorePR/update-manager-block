@@ -1,0 +1,14 @@
+version: "2.1"
+
+services:
+  update-manager:
+    build: .
+    restart: unless-stopped
+    network_mode: host
+
+    environment:
+      POLL_INTERVAL: ${POLL_INTERVAL:-10}
+      SAVE_UPDATE_STATES: ${SAVE_UPDATE_STATES:-5}
+
+    labels:
+      io.balena.features.supervisor-api: "1"

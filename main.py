@@ -1,24 +1,33 @@
 import json
 import logging
 import os
-import signal
+import sys
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import time
+from urllib import request
 
-from lockfile import LockFile, AlreadyLocked, NotLocked 
-from std_msgs.msg import UInt16
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy
+from rclpy.executors import ExternalShutdownException
+from std_msgs.msg import UInt16
+from lockfile import LockFile, AlreadyLocked, NotLocked, NotMyLock
 
+BALENA_SUPERVISOR_ADDRESS = os.getenv("BALENA_SUPERVISOR_ADDRESS")
+BALENA_SUPERVISOR_API_KEY = os.getenv("BALENA_SUPERVISOR_API_KEY")
+
+POLL_INTERVAL = 10.0
 LOCK_PATH = "/tmp/balena/updates"
-PORT = int(os.getenv("PORT", "80"))
-UNLOCK_TOKEN = os.getenv("UNLOCK_TOKEN")
+
 SAVE_UPDATE_STATES = {
     int(x) for x in os.getenv("SAVE_UPDATE_STATES", "").split(",") if x
-    }
+}
 
-if not UNLOCK_TOKEN:
-    raise RuntimeError("UNLOCK_TOKEN no está definido")
+if not BALENA_SUPERVISOR_ADDRESS or not BALENA_SUPERVISOR_API_KEY:
+    raise RuntimeError(
+        "Error: Missing environment variables. Please set "
+        "BALENA_SUPERVISOR_ADDRESS and BALENA_SUPERVISOR_API_KEY."
+    )
 
 os.makedirs(os.path.dirname(LOCK_PATH), exist_ok=True)
 
@@ -26,168 +35,268 @@ lock = LockFile(LOCK_PATH)
 state_lock = threading.Lock()
 running = threading.Event()
 running.set()
+
+waiting_for_update = False
+update_allowed = False
 robot_state = -1
+lock_released_for_update = False
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+    force=True,
+)
 
 logger = logging.getLogger(__name__)
 
-class StateListener(Node):
+
+class UpdateManagerNode(Node):
     def __init__(self):
-        super().__init__("state_listener")
-        self.subscription = self.create_subscription(
+        super().__init__("update_manager")
+
+        self.state_sub = self.create_subscription(
             UInt16,
             "/state",
-            self.listener_callback,
+            self.state_callback,
             10,
         )
 
-    def listener_callback(self, msg: UInt16):
+        self.update_allow_sub = self.create_subscription(
+            UInt16,
+            "/update_allowed",
+            self.update_allowed_callback,
+            10,
+        )
+
+        qos_profile = QoSProfile(
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+
+        self.update_pending_pub = self.create_publisher(
+            UInt16,
+            "/update_pending",
+            qos_profile,
+        )
+
+    def state_callback(self, msg: UInt16):
         global robot_state
-        robot_state = msg.data
-        logging.info("Estado del robot actualizado: %s", robot_state)
+        try:
+            with state_lock:
+                robot_state = int(msg.data)
+                current_state = robot_state
 
-def start_ros2_listener():
-    rclpy.init()
-    node = StateListener()
+            logger.info("Estado del robot actualizado: %s", current_state)
+            evaluate_unlock_condition()
+        except Exception as e:
+            logger.error("Error en state_callback: %s", e)
 
-    def spin_ros2():
-        while running.is_set():
-            rclpy.spin_once(node, timeout_sec=0.5)
+    def update_allowed_callback(self, msg: UInt16):
+        global update_allowed
+        try:
+            with state_lock:
+                previous_allowed = update_allowed
+                update_allowed = bool(msg.data)
+                current_allowed = update_allowed
 
-    ros_thread = threading.Thread(target=spin_ros2, daemon=True)
-    ros_thread.start()
-    logging.info("ROS2 listener iniciado")
-    return node, ros_thread
+            if current_allowed != previous_allowed:
+                logger.info(
+                    "update_allowed cambiado: %s -> %s",
+                    previous_allowed,
+                    current_allowed,
+                )
+            else:
+                logger.info("update_allowed recibido sin cambio: %s", current_allowed)
+
+            evaluate_unlock_condition()
+        except Exception as e:
+            logger.error("Error en update_allowed_callback: %s", e)
+
+    def publish_update_pending(self, pending: bool):
+        if not rclpy.ok():
+            return
+
+        try:
+            msg = UInt16()
+            msg.data = 1 if pending else 0
+            self.update_pending_pub.publish(msg)
+        except Exception as e:
+            logger.warning("Error al publicar update_pending: %s", e)
+
 
 def acquire_lock() -> bool:
     with state_lock:
         try:
             lock.acquire(timeout=0)
-            logging.info("Lock adquirido en %s", LOCK_PATH)
+            logger.info("Lock adquirido en %s", LOCK_PATH)
             return True
         except AlreadyLocked:
-            logging.info("El lock ya está adquirido")
+            logger.info("Lock ya existente")
             return False
 
-def release_lock() -> None:
+
+def release_lock() -> bool:
+    global lock_released_for_update
+
     with state_lock:
         try:
-            lock.break_lock()
-            logging.info("Lock liberado")
+            lock.release()
+            lock_released_for_update = True
+            logger.info("Lock liberado en %s", LOCK_PATH)
+            return True
         except NotLocked:
-            logging.warning("El lock ya estaba liberado")
+            logger.info("El lock ya estaba liberado")
+            return False
+        except NotMyLock:
+            logger.warning("El lock no pertenece a este proceso")
+            return False
+        except Exception as e:
+            logger.warning("Error al liberar lock: %s", e)
+            return False
+
 
 def is_locked() -> bool:
-    with state_lock:
+    try:
         return lock.is_locked()
+    except Exception:
+        return False
 
-def is_manual_mode() -> bool:
+
+def evaluate_unlock_condition():
     with state_lock:
-        return robot_state in SAVE_UPDATE_STATES
-        
-def check_token(handler: BaseHTTPRequestHandler) -> bool:
-    expected = f"Bearer {UNLOCK_TOKEN}"
-    auth = handler.headers.get("Authorization", "")
-    return auth == expected
+        current_state = robot_state
+        current_allowed = update_allowed
+        current_waiting = waiting_for_update
+        current_locked = lock.is_locked()
 
-class Handler(BaseHTTPRequestHandler):
-    def _send_json(self, code: int, payload: dict) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    if (
+        current_allowed
+        and current_state in SAVE_UPDATE_STATES
+        and current_waiting
+        and current_locked
+    ):
+        logger.info("Condición de desbloqueo cumplida, liberando lock")
+        release_lock()
 
-    def do_GET(self):
-        if self.path == "/status":
-            self._send_json(
-                200,
-                {
-                    "locked": is_locked(),
-                    "lock_path": LOCK_PATH,
-                    "running": running.is_set(),
-                    "robot_state": robot_state,
-                    "manual_mode": is_manual_mode(),
-                },
-            )
-            return
-        self._send_json(404, { "error": "not_found"})
 
-    def do_POST(self):
-        if not check_token(self):
-            self._send_json(401, { "error": "unauthorized" })
-            return
-        
-        if self.path == "/unlock":
-            if not is_manual_mode():
-                self._send_json(403, { "ok": False, "error": "forbidden", "reason": "robot_not_in_manual_mode" })
-                return
-            release_lock()
-            self._send_json(200, { "ok": True, "locked": is_locked() })
-            return
-        
-        if self.path == "/lock":
+def fetch_device_state():
+    url = (
+        f"{BALENA_SUPERVISOR_ADDRESS}/v1/device"
+        f"?apikey={BALENA_SUPERVISOR_API_KEY}"
+    )
+
+    req = request.Request(
+        url,
+        method="GET",
+        headers={"Content-Type": "application/json"},
+    )
+
+    with request.urlopen(req, timeout=5) as response:
+        body = response.read().decode("utf-8")
+        return json.loads(body)
+
+def ensure_lock_owned():
+    with state_lock:
+        if lock.is_locked():
+            logger.info("Existe lock previo; reclamándolo para esta instancia")
             try:
-                acquire = acquire_lock()
-                if not acquire:
-                    self._send_json(409, { "ok": False, "error": "already_locked", "locked": True })
-                    return
-                self._send_json(200, { "ok": True, "locked": True })
-            except Exception as exc:
-                logging.exception("Error adquiriendo lock %s", exc)
-                self._send_json(500, { "ok": False, "error": str(exc) })
-            return
-        
-        self._send_json(404, { "error": "not_found" })
+                lock.break_lock()
+            except Exception as e:
+                logger.warning("No se pudo romper lock previo: %s", e)
 
-    def log_message(self, format, *args):
-        request_info = format % args
-        logging.debug("HTTP: %s", request_info)
+        try:
+            lock.acquire(timeout=0)
+            logger.info("Lock adquirido por esta instancia")
+            return True
+        except AlreadyLocked:
+            logger.info("No se pudo adquirir lock; sigue existiendo")
+            return False
 
-def serve_http() -> None:
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
-    server.timeout=1
-    logging.info("Servidor HTTP escuchando en puerto %s", PORT)
+def start_ros2():
+    rclpy.init()
+    node = UpdateManagerNode()
+
+    def spin():
+        try:
+            while running.is_set():
+                try:
+                    rclpy.spin_once(node, timeout_sec=0.1)
+                except ExternalShutdownException:
+                    logger.debug("ROS2 external shutdown detectado en spin thread")
+                    break
+        except Exception as e:
+            logger.error("Error en ROS2 spin thread: %s", e)
+
+    ros_thread = threading.Thread(target=spin, daemon=True)
+    ros_thread.start()
+    logger.info("ROS2 iniciado")
+    return node, ros_thread
+
+
+def main():
+    global waiting_for_update, lock_released_for_update
+
+    node, ros_thread = start_ros2()
+    ensure_lock_owned()
+
+    previous_waiting = None
 
     try:
         while running.is_set():
-            server.handle_request()
+            try:
+                data = fetch_device_state()
+
+                waiting = (
+                    bool(data.get("update_pending", False))
+                    and bool(data.get("update_failed", False))
+                )
+
+                with state_lock:
+                    waiting_for_update = waiting
+                    current_lock_released = lock_released_for_update
+
+                if waiting != previous_waiting:
+                    logger.info("Waiting cambiado: %s -> %s", previous_waiting, waiting)
+
+                    if (
+                        previous_waiting == True
+                        and waiting == False
+                        and current_lock_released
+                        and not is_locked()
+                    ):
+                        logger.info("Update terminada; reintentando adquirir lock")
+                        acquired = acquire_lock()
+                        if acquired:
+                            with state_lock:
+                                lock_released_for_update = False
+
+                    previous_waiting = waiting
+
+                if running.is_set():
+                    try:
+                        node.publish_update_pending(waiting)
+                    except Exception as e:
+                        logger.warning("No se pudo publicar update_pending: %s", e)
+
+                evaluate_unlock_condition()
+
+            except Exception as e:
+                logger.error("Error fetching device state: %s", e)
+
+            time.sleep(POLL_INTERVAL)
+
     finally:
-        server.server_close()
-
-def handle_signal(signum, frame) -> None:
-    logging.info("Señal recibida, cerrando update-manager")
-    running.clear()
-
-def main() -> None:
-    import sys
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        stream=sys.stdout,
-        force=True,
-    )
-
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
-
-    logging.info("Arrancando update-manager")
-
-    ros2_node, ros2_thread = start_ros2_listener()
-
-    acquire_lock()
-    logging.info("Sistema bloqueado al arrancar")
-    
-    try:
-        serve_http()
-    finally:
-        release_lock()
         running.clear()
-        ros2_thread.join(timeout=5)
-        ros2_node.destroy_node()
-        rclpy.shutdown()
-        logging.info("Proceso finalizado")
+        ros_thread.join(timeout=2)
+        try:
+            node.destroy_node()
+            rclpy.shutdown()
+        except Exception as e:
+            logger.warning("Error durante shutdown de ROS2: %s", e)
+        logger.info("ROS2 detenido")
+
 
 if __name__ == "__main__":
     main()
