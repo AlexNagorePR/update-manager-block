@@ -1,3 +1,2 @@
 lockfile
-std_msgs
-rclpy
+PyYAML
