@@ -3,10 +3,9 @@ import logging
 import os
 import signal
 import threading
-import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from lockfile import LockFile, AlreadyLocked, NotLocked, NotMyLock
+from lockfile import LockFile, AlreadyLocked, NotLocked 
 from std_msgs.msg import UInt16
 import rclpy
 from rclpy.node import Node
@@ -76,8 +75,6 @@ def release_lock() -> None:
             logging.info("Lock liberado")
         except NotLocked:
             logging.warning("El lock ya estaba liberado")
-        except NotMyLock:
-            logging.warning("El lock no fue adquirido por este proceso")
 
 def is_locked() -> bool:
     with state_lock:
