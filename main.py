@@ -89,7 +89,6 @@ class UpdateManagerNode(Node):
                 current_state = robot_state
 
             logger.info("Estado del robot actualizado: %s", current_state)
-            evaluate_unlock_condition()
         except Exception as e:
             logger.error("Error en state_callback: %s", e)
 
@@ -110,7 +109,6 @@ class UpdateManagerNode(Node):
             else:
                 logger.info("update_allowed recibido sin cambio: %s", current_allowed)
 
-            evaluate_unlock_condition()
         except Exception as e:
             logger.error("Error en update_allowed_callback: %s", e)
 
@@ -177,7 +175,7 @@ def evaluate_unlock_condition():
         and current_waiting
         and current_locked
     ):
-        logger.info("Condición de desbloqueo cumplida, liberando lock")
+        logger.info("Condicion de desbloqueo cumplida, liberando lock")
         release_lock()
 
 
@@ -236,7 +234,7 @@ def start_ros2():
 
 
 def main():
-    global waiting_for_update, lock_released_for_update
+    global waiting_for_update, lock_released_for_update, update_allowed
 
     node, ros_thread = start_ros2()
     ensure_lock_owned()
@@ -271,6 +269,8 @@ def main():
                         if acquired:
                             with state_lock:
                                 lock_released_for_update = False
+                                update_allowed = False
+                            logger.info("update_allowed reseteado a %s", update_allowed)
 
                     previous_waiting = waiting
 
