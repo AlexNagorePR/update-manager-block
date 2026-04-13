@@ -16,11 +16,11 @@ from lockfile import LockFile, AlreadyLocked, NotLocked, NotMyLock
 BALENA_SUPERVISOR_ADDRESS = os.getenv("BALENA_SUPERVISOR_ADDRESS")
 BALENA_SUPERVISOR_API_KEY = os.getenv("BALENA_SUPERVISOR_API_KEY")
 
-POLL_INTERVAL = 10.0
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "10"))
 LOCK_PATH = "/tmp/balena/updates"
 
 SAVE_UPDATE_STATES = {
-    int(x) for x in os.getenv("SAVE_UPDATE_STATES", "").split(",") if x
+    int(x) for x in os.getenv("FLE_SAVE_UPDATE_STATES", "").split(",") if x
 }
 
 if not BALENA_SUPERVISOR_ADDRESS or not BALENA_SUPERVISOR_API_KEY:
