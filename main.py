@@ -8,19 +8,26 @@ from urllib import request
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, DurabilityPolicy
+from rclpy.qos import HistoryPolicy, QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from rclpy.executors import ExternalShutdownException
-from std_msgs.msg import UInt16
+from std_msgs.msg import UInt16, Bool
 from lockfile import LockFile, AlreadyLocked, NotLocked, NotMyLock
+
+GetUpdateState = None
+try:
+    from update_manager.srv import GetUpdateState
+except (ImportError, ModuleNotFoundError):
+    # Service not available - likely running in test mode without compiled interfaces
+    pass
 
 BALENA_SUPERVISOR_ADDRESS = os.getenv("BALENA_SUPERVISOR_ADDRESS")
 BALENA_SUPERVISOR_API_KEY = os.getenv("BALENA_SUPERVISOR_API_KEY")
 
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "10"))
+POLL_INTERVAL = 10
 LOCK_PATH = "/tmp/balena/updates"
 
-SAVE_UPDATE_STATES = {
-    int(x) for x in os.getenv("FLE_SAVE_UPDATE_STATES", "").split(",") if x
+SAFE_UPDATE_STATES = {
+    int(x) for x in os.getenv("FLE_SAFE_UPDATE_STATES", "").split(",") if x
 }
 
 if not BALENA_SUPERVISOR_ADDRESS or not BALENA_SUPERVISOR_API_KEY:
@@ -64,22 +71,35 @@ class UpdateManagerNode(Node):
         )
 
         self.update_allow_sub = self.create_subscription(
-            UInt16,
+            Bool,
             "/update_allowed",
             self.update_allowed_callback,
             10,
         )
 
         qos_profile = QoSProfile(
-            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
         )
 
         self.update_pending_pub = self.create_publisher(
-            UInt16,
+            Bool,
             "/update_pending",
             qos_profile,
         )
+
+        # Create service server for querying update state
+        if GetUpdateState is not None:
+            self.get_update_state_srv = self.create_service(
+                GetUpdateState,
+                "/get_update_state",
+                self.get_update_state_callback,
+            )
+            logger.info("Servicio /get_update_state disponible")
+        else:
+            logger.warning("GetUpdateState service interface not available")
 
     def state_callback(self, msg: UInt16):
         global robot_state
@@ -92,7 +112,7 @@ class UpdateManagerNode(Node):
         except Exception as e:
             logger.error("Error en state_callback: %s", e)
 
-    def update_allowed_callback(self, msg: UInt16):
+    def update_allowed_callback(self, msg: Bool):
         global update_allowed
         try:
             with state_lock:
@@ -117,11 +137,23 @@ class UpdateManagerNode(Node):
             return
 
         try:
-            msg = UInt16()
-            msg.data = 1 if pending else 0
+            msg = Bool()
+            msg.data = pending
             self.update_pending_pub.publish(msg)
         except Exception as e:
             logger.warning("Error al publicar update_pending: %s", e)
+
+    def get_update_state_callback(self, request, response):
+        """Service callback to query the current update pending state."""
+        try:
+            with state_lock:
+                response.update_pending = waiting_for_update
+            logger.info("Servicio /get_update_state consultado: %s", response.update_pending)
+        except Exception as e:
+            logger.error("Error en get_update_state_callback: %s", e)
+            response.update_pending = False
+        
+        return response
 
 
 def acquire_lock() -> bool:
@@ -171,7 +203,7 @@ def evaluate_unlock_condition():
 
     if (
         current_allowed
-        and current_state in SAVE_UPDATE_STATES
+        and current_state in SAFE_UPDATE_STATES
         and current_waiting
         and current_locked
     ):
@@ -232,6 +264,17 @@ def start_ros2():
     logger.info("ROS2 iniciado")
     return node, ros_thread
 
+def is_waiting_for_update(device_state: dict) -> bool:
+    """
+    Consideramos que hay una actualización pendiente de aplicación cuando
+    el supervisor reporta simultáneamente update_pending y update_failed.
+    Esta interpretación está basada en el comportamiento observado del
+    supervisor en este sistema.
+    """
+    return (
+        bool(device_state.get("update_pending", False))
+        and bool(device_state.get("update_failed", False))
+    )
 
 def main():
     global waiting_for_update, lock_released_for_update, update_allowed
@@ -246,10 +289,7 @@ def main():
             try:
                 data = fetch_device_state()
 
-                waiting = (
-                    bool(data.get("update_pending", False))
-                    and bool(data.get("update_failed", False))
-                )
+                waiting = is_waiting_for_update(data)
 
                 with state_lock:
                     waiting_for_update = waiting

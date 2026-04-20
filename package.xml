@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>update_manager</name>
+  <version>0.0.0</version>
+  <description>Balena update manager node for ROS2</description>
+  <maintainer email="support@balena.io">Balena</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>rosidl_default_generators</depend>
+
+  <member_of_group>rosidl_interface_packages</member_of_group>
+</package>

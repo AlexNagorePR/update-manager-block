@@ -1,0 +1,13 @@
+tests/
+htmlcov/
+.coverage
+.pytest_cache/
+*.pyc
+__pycache__/
+pytest.ini
+conftest.py
+venv/
+.git/
+.gitignore
+README.md
+repomix*

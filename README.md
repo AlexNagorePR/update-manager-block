@@ -1,305 +1,331 @@
-# Update Manager - Lógica de Funcionamiento
+# Update Manager para Balena
 
-## Propósito
+Gestor de actualizaciones para dispositivos Balena que coordina el timing de las actualizaciones de firmware mediante un sistema de locks y monitoreo de estado del robot.
 
-El Update Manager gestiona un archivo de lock (`/tmp/balena/updates`) para coordinar cuándo se permite hacer actualizaciones en un dispositivo Balena. Actúa como guardián que bloquea o permite las actualizaciones según el estado del robot y las condiciones configuradas.
+## Descripción General
 
-## Arquitectura General
+El Update Manager actúa como intermediario entre el Supervisor de Balena y el sistema de control del robot, asegurando que las actualizaciones de firmware solo ocurran cuando el robot está en un estado seguro. Utiliza:
 
-El sistema está dividido en dos componentes principales:
+- **Lock file** (`/tmp/balena/updates`) para coordinar acceso
+- **ROS2** para comunicación en tiempo real  
+- **Supervisor API** de Balena para detectar actualizaciones pendientes
 
-### 1. **ROS2 Node** (Asincrónico)
-- Se ejecuta en un thread separado (`spin_thread`)
-- Se suscribe a dos tópicos:
-  - `/update_allowed` - Autorización para actualizar (0=no, 1=sí)
-  - `/state` - Estado actual del robot
-- Publica en `/update_pending` el estado de la actualización
-- Los callbacks evalúan las condiciones de desbloqueo en tiempo real
+## Requisitos
 
-### 2. **Main Loop** (Síncrono, cada 10 segundos)
-- Consulta el Supervisor de Balena
-- Detecta cambios en el estado de actualización
-- Maneja la reacquisición del lock después de una actualización
+- Python 3.12+
+- ROS2 Jazzy
+- Docker (para despliegue en Balena)
+- Balena CLI (para push a balenaCloud)
 
-## Estado del Lock: Máquina de Estados
+### Variables de Entorno Requeridas
 
-```
-┌─────────────────────────┐
-│ INICIALIZATION          │
-│ ensure_lock_owned()     │
-└────────────┬────────────┘
-             │
-             ▼
-┌─────────────────────────┐
-│ LOCK ADQUIRIDO          │
-│ (Bloqueadas updates)    │
-│ loop principal corriendo│
-└────────────┬────────────┘
-             │
-             │ Se cumplen condiciones:
-             │ • update_allowed == 1
-             │ • robot_state ∈ SAVE_UPDATE_STATES
-             │ • waiting_for_update == True
-             │ • lock está adquirido
-             ▼
-┌─────────────────────────┐
-│ LOCK LIBERADO           │
-│ (Permitida update)      │
-└────────────┬────────────┘
-             │
-             │ Update termina
-             │ (waiting → False)
-             ▼
-┌─────────────────────────┐
-│ LOCK RE-ADQUIRIDO       │
-│ (Update completada)     │
-└─────────────────────────┘
+```bash
+BALENA_SUPERVISOR_ADDRESS=http://localhost:48484
+BALENA_SUPERVISOR_API_KEY=<your-api-key>
+FLE_SAFE_UPDATE_STATES=1,2,3  # Estados seguros para actualizar
 ```
 
-## Flujo de Ejecución Detallado
+## Instalación
 
-### Fase 1: Inicialización
+### Desarrollo Local
+
+```bash
+# Crear virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Instalar dependencias
+pip install -r requirements.txt
+
+# Instalar dependencias de desarrollo (para tests)
+pip install -r requirements-dev.txt
+```
+
+### Construcción Docker
+
+```bash
+docker build -t update-manager:latest .
+```
+
+## Ejecución
+
+### Modo Local (Desarrollo)
+
+```bash
+source venv/bin/activate
+
+export BALENA_SUPERVISOR_ADDRESS=http://localhost:48484
+export BALENA_SUPERVISOR_API_KEY=your-key
+export FLE_SAFE_UPDATE_STATES=1,2,3
+
+python main.py
+```
+
+### Modo Docker (Balena)
+
+```bash
+balena push <app-name>
+```
+
+## Testing
+
+### Ejecutar Tests
+
+```bash
+# Instalar dependencias de test (si no lo has hecho)
+pip install -r requirements-dev.txt
+
+# Ejecutar toda la suite
+pytest
+
+# Con output verboso
+pytest -v
+
+# Con cobertura en terminal
+pytest --cov=. --cov-report=term-missing
+
+# Generar reporte HTML de cobertura
+pytest --cov=. --cov-report=html
+# Abre htmlcov/index.html en el navegador
+```
+
+### Cobertura de Tests
+
+Se incluyen **25 tests** con **71% de cobertura**:
+
+| Clase | Tests | Descripción |
+|-------|-------|-------------|
+| `TestLockOperations` | 6 | Adquisición, liberación y estado de locks |
+| `TestUpdateStateLogic` | 5 | Determinación de actualizaciones pendientes |
+| `TestUnlockCondition` | 5 | Evaluación de condiciones de desbloqueo |
+| `TestFetchDeviceState` | 2 | Obtención de estado del supervisor |
+| `TestNodeCallbacks` | 4 | Callbacks de ROS2 |
+| `TestEnsureLockOwned` | 3 | Seguridad de propiedad del lock |
+
+## Servicios ROS2
+
+### Publisher: `/update_pending`
+
+**Tipo:** `std_msgs/Bool`  
+**Frecuencia:** Variable (cuando hay cambios)
+
+Publica el estado de actualización pendiente:
+- `true` - Actualización en progreso esperando permiso
+- `false` - Sin actualización pendiente
+
+### Service: `/get_update_state`
+
+**Tipo:** `update_manager/srv/GetUpdateState`
+
+Permite consultar el estado actual de la actualización:
+
+```bash
+ros2 service call /get_update_state update_manager/srv/GetUpdateState
+```
+
+**Respuesta:**
+```
+response:
+  update_pending: false
+```
+
+### Subscriber: `/state`
+
+**Tipo:** `std_msgs/UInt16`
+
+Estado del robot. Solo se libera el lock si el estado está en `FLE_SAFE_UPDATE_STATES`.
+
+### Subscriber: `/update_allowed`
+
+**Tipo:** `std_msgs/Bool`
+
+Autorización para proceder con la actualización.
+
+## Arquitectura
+
+```
+┌──────────────────────────────────┐
+│     Update Manager Node          │
+├──────────────────────────────────┤
+│                                  │
+│  Main Loop (cada 10s)            │
+│  ├─ Fetch device state           │
+│  ├─ Manage lock                  │
+│  └─ Detect transitions           │
+│                                  │
+│  ROS2 Thread (async)             │
+│  ├─ Subscribe /state             │
+│  ├─ Subscribe /update_allowed    │
+│  ├─ Publish /update_pending      │
+│  └─ Service /get_update_state    │
+│                                  │
+└──────────────────────────────────┘
+      ↓                    ↓
+   Supervisor API      ROS2 Network
+   (Balena)          (Robot System)
+```
+
+## Máquina de Estados
+
+```
+INICIALIZACIÓN
+    ├─ Detecta lock previo (break_lock)
+    └─ Adquiere nuevo lock
+         ↓
+LOCK ADQUIRIDO
+    (bloqueadas actualizaciones)
+         │
+         ├─ Se cumplen condiciones:
+         │  • update_allowed = True
+         │  • robot_state ∈ SAFE_STATES
+         │  • waiting_for_update = True
+         │  • lock adquirido
+         │
+         ▼
+LOCK LIBERADO
+    (permitida actualización)
+         │
+         ├─ Update en progreso
+         ├─ waiting → False (completa)
+         │
+         ▼
+LOCK RE-ADQUIRIDO
+    (ciclo nuevo)
+```
+
+## Condición de Desbloqueo
+
+El lock se libera solo cuando **TODAS** estas condiciones son verdaderas:
 
 ```python
-ensure_lock_owned()
+if (
+    update_allowed                          # De /update_allowed
+    and robot_state in FLE_SAFE_UPDATE_STATES  # De /state  
+    and waiting_for_update                  # Del Supervisor
+    and lock.is_locked()                    # Nosotros lo poseemos
+):
+    release_lock()
 ```
 
-1. **Detecta lock heredado**: Si existe un lock del proceso anterior que falló
-2. **Lo rompe**: Usa `break_lock()` para forzar su liberación
-3. **Adquiere nuevo lock**: Obtiene un lock fresco para esta instancia
+## Configuración
 
-**Decisión de diseño**: Los locks huérfanos NO se limpian automáticamente. Si el servicio falla, las actualizaciones permanecen bloqueadas (fail-safe).
+### Variables de Entorno
 
-### Fase 2: Loop Principal (cada 10 segundos)
-
-```
-Fetch device state
-    ↓
-Evalúa: waiting = update_pending AND update_failed
-    ↓
-Compara con estado anterior
-    ↓
-    ├─ waiting cambió True → False
-    │  └─ Si nosotros liberamos el lock previamente
-    │     └─ Re-adquiere el lock
-    │
-    └─ Publica estado en /update_pending
-        ↓
-        Evalúa condiciones de desbloqueo
+```bash
+BALENA_SUPERVISOR_ADDRESS    # URL del Supervisor
+BALENA_SUPERVISOR_API_KEY    # API key del Supervisor
+FLE_SAFE_UPDATE_STATES       # Estados permitidos (ej: 1,2,3)
 ```
 
-### Fase 3: Monitoreo en Tiempo Real (ROS2 Callbacks)
-
-Los callbacks se ejecutan de manera asincrónica cuando llegan mensajes:
-
-#### `state_callback(robot_state)`
-```
-Actualiza robot_state
-    ↓
-Evalúa condiciones de desbloqueo
-```
-
-#### `update_allowed_callback(update_allowed)`
-```
-Actualiza update_allowed
-    ↓
-Log si cambió
-    ↓
-Evalúa condiciones de desbloqueo
-```
-
-### Fase 4: Evaluación de Desbloqueo
+### Constantes (en main.py)
 
 ```python
-evaluate_unlock_condition()
+POLL_INTERVAL = 10           # Segundos entre polls
+LOCK_PATH = "/tmp/balena/updates"
 ```
 
-Se verifica si **TODAS** estas condiciones son verdaderas:
+## Troubleshooting
 
-| Condición | Origen | Significado |
-|-----------|--------|-------------|
-| `update_allowed == 1` | `/update_allowed` | Autorizado actualizar |
-| `robot_state ∈ SAVE_UPDATE_STATES` | `/state` | Estado compatible |
-| `waiting_for_update == True` | Supervisor Balena | Hay update pendiente |
-| `lock.is_locked()` | File system | Nosotros tenemos el lock |
+### "Lock ya existente"
 
-**Si todas son verdaderas**: Libera el lock → Permite actualización
+El lock previo no fue liberado. **Esto es fail-safe** - actualizaciones permanecen bloqueadas.
 
-### Fase 5: Post-Actualización
+Soluciones:
+- El servicio intenta romper y re-adquirir automáticamente
+- Verifica que el proceso anterior se terminó correctamente
+
+### "Update no se libera"
+
+Verificar que:
+1. `/update_allowed` esté en `true`
+2. `/state` esté en `FLE_SAFE_UPDATE_STATES`  
+3. Supervisor reporte `update_pending=true` Y `update_failed=true`
+
+```bash
+# Ver estado del robot
+ros2 topic echo /state
+
+# Ver permiso de actualización
+ros2 topic echo /update_allowed
+
+# Consultar estado de actualización
+ros2 service call /get_update_state update_manager/srv/GetUpdateState
+```
+
+## Logs
+
+Formato: `YYYY-MM-DD HH:MM:SS - LEVEL - MESSAGE`
+
+Eventos importantes:
+```
+2024-04-20 10:30:45 - INFO - Lock adquirido en /tmp/balena/updates
+2024-04-20 10:30:45 - INFO - update_allowed cambiado: False -> True
+2024-04-20 10:30:55 - INFO - Estado del robot actualizado: 1
+2024-04-20 10:30:55 - INFO - Condicion de desbloqueo cumplida, liberando lock
+2024-04-20 10:31:05 - INFO - Update terminada; reintentando adquirir lock
+```
+
+## Estructura del Proyecto
 
 ```
-waiting → False (update terminó)
-    ↓
-    ├─ Detecta cambio
-    │
-    ├─ Comprueba:
-    │  • previous_waiting == True
-    │  • waiting == False
-    │  • Nosotros liberamos el lock
-    │  • Lock no está adquirido
-    │
-    └─ Re-adquiere el lock
-       └─ lock_released_for_update = False
+update-manager/
+├── main.py                    # Aplicación principal
+├── requirements.txt           # Deps de producción
+├── requirements-dev.txt       # Deps de desarrollo
+├── package.xml                # Configuración ROS2
+├── CMakeLists.txt             # Build configuration
+├── Dockerfile                 # Build para Balena
+├── docker-compose.yaml        # Compose local
+├── .dockerignore              # Exclusiones Docker
+├── .gitignore                 # Exclusiones Git
+├── srv/
+│   └── GetUpdateState.srv     # Definición de servicio
+└── tests/
+    ├── test_main.py           # Suite de tests
+    ├── conftest.py            # Fixtures
+    └── README.md              # Docs de tests
 ```
-
-## Variables de Estado Globales
-
-| Variable | Tipo | Propósito |
-|----------|------|----------|
-| `waiting_for_update` | bool | ¿Hay actualización pendiente? |
-| `update_allowed` | bool | ¿Está autorizada la actualización? |
-| `robot_state` | int | Estado actual del robot |
-| `lock_released_for_update` | bool | ¿Liberamos el lock para una update? |
-
-Todas protegidas por `state_lock` (mutex).
 
 ## Thread Safety
 
-- **`state_lock`**: Mutex que protege acceso a variables globales
-- Se usa en:
-  - Callbacks de ROS2
-  - Funciones de lock/unlock
-  - Actualización de estado
-  - Evaluación de condiciones
+- Todas las variables globales protegidas por `state_lock` (mutex)
+- ROS2 callbacks y main loop se sincronizan correctamente
+- Operaciones de lock son atómicas
 
-## Manejo de Errores
+## Garantías
 
-### En Callbacks
+✅ **Garantizado:**
+- Lock se libera solo si se cumplen las 4 condiciones
+- Re-adquisición cuando termina la actualización
+- Thread-safe
+
+⚠️ **Con fallos:**
+- Si el proceso falla: lock queda huérfano (fail-safe)
+- Próximo arranque: se limpia automáticamente
+
+❌ **No garantizado:**
+- Respuesta del Supervisor en 5 segundos
+- Tópicos ROS2 en tiempo real
+- Conectividad de red
+
+## Desarrollo
+
+### Añadir Tests
+
 ```python
-try:
-    # Actualizar estado
-    evaluate_unlock_condition()
-except Exception as e:
-    logger.error("Error: %s", e)
-    # Continúa ejecutándose, no rompe ROS2
+# En tests/test_main.py
+def test_mi_feature(mock_lock, env_vars):
+    """Descripción del test."""
+    import main
+    # Tu código aquí
+    assert resultado == esperado
 ```
 
-### En Loop Principal
-```python
-try:
-    fetch_device_state()
-    # Procesar datos
-except Exception as e:
-    logger.error("Error fetching device state: %s", e)
-    # Continúa en el siguiente ciclo
-```
-
-### En ROS2 Shutdown
-```python
-try:
-    node.destroy_node()
-    rclpy.shutdown()
-except Exception as e:
-    logger.warning("Error durante shutdown: %s", e)
-    # Continúa limpieza
-```
-
-## Configuración Requerida
-
-### Variables de Entorno
-- `BALENA_SUPERVISOR_ADDRESS`: Dirección del supervisor (ej: `http://127.0.0.1:48484`)
-- `BALENA_SUPERVISOR_API_KEY`: API key para autenticación
-- `SAVE_UPDATE_STATES`: Estados donde se permite actualizar (comma-separated, ej: `1,2,3`)
-
-### Archivo de Lock
-- **Ubicación**: `/tmp/balena/updates`
-- **Propósito**: Coordina con otros procesos
-- **Comportamiento**: Persiste entre reinicios (fail-safe)
-
-## Garantías y Comportamientos
-
-### ✅ Garantizada
-- El lock se libera **solo** cuando se cumplen las 4 condiciones
-- La re-adquisición ocurre cuando la update termina
-- Thread-safe: toda la sincronización es atómica
-
-### ⚠️ Con Fallos
-- Si el proceso falla: lock queda huérfano (by design - seguridad)
-- Próximo arranque: `ensure_lock_owned()` lo limpia
-- Las updates permanecen bloqueadas hasta nueva autorización
-
-### ❌ No Garantizado
-- El Supervisor responda en 5 segundos
-- Los tópicos ROS2 lleguen en tiempo real
-- La red esté disponible
-
-## Diagrama de Flujo Completo
-
-```
-START
-  ↓
-ensure_lock_owned() ─→ Adquiere lock
-  ↓
-Inicia ROS2 thread
-  ↓
-LOOP:
-  ├─ Fetch device state (timeout 5s)
-  ├─ Calcula: waiting = update_pending AND update_failed
-  ├─ Publica en /update_pending
-  ├─ Evalúa desbloqueo:
-  │   Si todas condiciones → libera lock
-  ├─ Detecta transición waiting True→False
-  │   Si es nuestra → re-adquiere lock
-  └─ Sleep 10 segundos
-  
-CALLBACKS (ROS2 threads):
-  ├─ state_callback()
-  │   └─ Evalúa desbloqueo
-  └─ update_allowed_callback()
-      └─ Evalúa desbloqueo
-
-SHUTDOWN:
-  ├─ Detiene main loop
-  ├─ Para ROS2 thread
-  ├─ Limpia nodo
-  └─ END
-```
-
-## Casos de Uso
-
-### Caso 1: Actualización Normal
-```
-1. Robot en estado permitido, update autorizada
-2. update_pending=true, update_failed=false → waiting=false (aún no problemas)
-3. update_pending=true, update_failed=true → waiting=true
-4. Condiciones cumplidas → LOCK SE LIBERA
-5. Updater realiza actualización
-6. waiting → false (update terminó)
-7. Detecta cambio, re-adquiere lock
-```
-
-### Caso 2: Robot No en Estado Permitido
-```
-1. waiting=true, update_allowed=true
-2. Pero robot_state ∉ SAVE_UPDATE_STATES
-3. Bloquea → Lock NO se libera
-4. Espera a que robot cambie estado
-5. Cuando entra en SAVE_UPDATE_STATES → Desbloquea
-```
-
-### Caso 3: Fallo y Reinicio
-```
-1. Proceso falla
-2. Lock queda en /tmp/balena/updates
-3. Servicio reinicia
-4. ensure_lock_owned() → break_lock() + acquire()
-5. Limpia y continúa
-```
-
-## Monitoreo y Debugging
-
-### Logs Importantes
-- `"Lock adquirido en /tmp/balena/updates"` - Arranque exitoso
-- `"update_allowed cambiado: False -> True"` - Cambio de autorización
-- `"Estado del robot actualizado: X"` - Estado cambió
-- `"Condición de desbloqueo cumplida, liberando lock"` - Update permitida
-- `"Update terminada; reintentando adquirir lock"` - Re-bloquea
-
-### Comandos Útiles
+Ejecutar solo uno:
 ```bash
-# Ver si existe el lock
-ls -la /tmp/balena/updates
-
-# Ver logs del servicio
-journalctl -u update-manager -f
+pytest tests/test_main.py::test_mi_feature -v
 ```
+
+## Licencia
+
+Apache-2.0
