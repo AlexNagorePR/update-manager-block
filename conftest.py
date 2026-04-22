@@ -9,7 +9,6 @@ from unittest.mock import MagicMock
 sys.modules['launch_testing'] = MagicMock()
 sys.modules['launch_testing_ros_pytest_entrypoint'] = MagicMock()
 sys.modules['launch'] = MagicMock()
-sys.modules['lark'] = MagicMock()
 
 
 

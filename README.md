@@ -27,7 +27,24 @@ FLE_SAFE_UPDATE_STATES=1,2,3  # Estados seguros para actualizar
 
 ## Instalación
 
-### Desarrollo Local
+### Opción 1: Instalación Rápida (Recomendado)
+
+```bash
+# Clonar el repositorio
+git clone <repo-url>
+cd update-manager
+
+# Setup automático del ambiente de desarrollo
+make setup
+
+# Activar el virtual environment
+source venv/bin/activate
+
+# Instalar dependencias de desarrollo (incluye testing)
+make install-dev
+```
+
+### Opción 2: Manual
 
 ```bash
 # Crear virtual environment
@@ -69,29 +86,52 @@ balena push <app-name>
 
 ## Testing
 
-### Ejecutar Tests
+### Ejecución Rápida de Tests
+
+**Opción 1: Con Make (Recomendado)**
 
 ```bash
-# Instalar dependencias de test (si no lo has hecho)
+# Ejecutar todos los tests
+make test
+
+# Tests con output detallado
+make test-verbose
+
+# Tests con cobertura y reporte HTML
+make test-coverage
+```
+
+**Opción 2: Con Script Bash**
+
+```bash
+# Ejecutar con instalación automática de dependencias
+chmod +x run_tests.sh
+./run_tests.sh
+```
+
+**Opción 3: Directo con pytest**
+
+```bash
+# Primero instalar dependencias (una sola vez)
 pip install -r requirements-dev.txt
 
-# Ejecutar toda la suite
+# Ejecutar tests
 pytest
 
 # Con output verboso
 pytest -v
 
 # Con cobertura en terminal
-pytest --cov=. --cov-report=term-missing
+pytest --cov=update_manager --cov-report=term-missing
 
 # Generar reporte HTML de cobertura
-pytest --cov=. --cov-report=html
+pytest --cov=update_manager --cov-report=html
 # Abre htmlcov/index.html en el navegador
 ```
 
-### Cobertura de Tests
+### Información de Cobertura
 
-Se incluyen **25 tests** con **71% de cobertura**:
+Se incluyen **30 tests** con cobertura completa del módulo principal:
 
 | Clase | Tests | Descripción |
 |-------|-------|-------------|
@@ -101,6 +141,8 @@ Se incluyen **25 tests** con **71% de cobertura**:
 | `TestFetchDeviceState` | 2 | Obtención de estado del supervisor |
 | `TestNodeCallbacks` | 4 | Callbacks de ROS2 |
 | `TestEnsureLockOwned` | 3 | Seguridad de propiedad del lock |
+| `TestIntegration` | 1 | Tests de integración (detección de deadlocks) |
+| `TestNotifySupervisor` | 4 | Notificación al supervisor |
 
 ## Servicios ROS2
 
@@ -115,19 +157,31 @@ Publica el estado de actualización pendiente:
 
 ### Service: `/get_update_state`
 
-**Tipo:** `update_manager/srv/GetUpdateState`
+**Tipo:** `std_srvs/Trigger` (servicio estándar ROS2)
 
-Permite consultar el estado actual de la actualización:
+Permite consultar el estado actual de la actualización. **No requiere parámetros en la request.**
+
+**Llamada:**
 
 ```bash
-ros2 service call /get_update_state update_manager/srv/GetUpdateState
+ros2 service call /get_update_state std_srvs/srv/Trigger
+```
+
+O equivalentemente:
+
+```bash
+ros2 service call /get_update_state std_srvs/srv/Trigger {}
 ```
 
 **Respuesta:**
 ```
 response:
-  update_pending: false
+  success: true      # true si hay actualización pendiente, false si no
+  message: ""        # Vacío si la consulta fue exitosa
 ```
+
+- `success`: Refleja el estado de `waiting_for_update` (si hay actualización pendiente)
+- `message`: Campo adicional (generalmente vacío)
 
 ### Subscriber: `/state`
 
@@ -140,6 +194,38 @@ Estado del robot. Solo se libera el lock si el estado está en `FLE_SAFE_UPDATE_
 **Tipo:** `std_msgs/Bool`
 
 Autorización para proceder con la actualización.
+
+## APIs del Supervisor de Balena
+
+El Update Manager interactúa con dos endpoints del Supervisor:
+
+### GET `/v1/device`
+
+Obtiene el estado del dispositivo, particularmente si hay una actualización pendiente:
+
+```json
+{
+  "update_pending": true,
+  "update_failed": false,
+  "update_downloaded": true,
+  // ... otros campos
+}
+```
+
+**Usado por:** `fetch_device_state()` cada 10 segundos en el loop principal.
+
+### POST `/v1/update`
+
+Notifica al Supervisor que la actualización puede proceder:
+
+```json
+{
+  "force": false,
+  "cancel": true
+}
+```
+
+**Usado por:** `notify_supervisor_update_allowed()` cuando se libera el lock.
 
 ## Arquitectura
 
@@ -184,6 +270,9 @@ LOCK ADQUIRIDO
          ▼
 LOCK LIBERADO
     (permitida actualización)
+         │
+         ├─ Notifica al Supervisor
+         │  (POST /v1/update con {"force": False, "cancel": True})
          │
          ├─ Update en progreso
          ├─ waiting → False (completa)
@@ -248,8 +337,8 @@ ros2 topic echo /state
 # Ver permiso de actualización
 ros2 topic echo /update_allowed
 
-# Consultar estado de actualización
-ros2 service call /get_update_state update_manager/srv/GetUpdateState
+# Consultar estado de actualización (servicio estándar)
+ros2 service call /get_update_state std_srvs/srv/Trigger
 ```
 
 ## Logs
@@ -278,8 +367,6 @@ update-manager/
 ├── docker-compose.yaml        # Compose local
 ├── .dockerignore              # Exclusiones Docker
 ├── .gitignore                 # Exclusiones Git
-├── srv/
-│   └── GetUpdateState.srv     # Definición de servicio
 └── tests/
     ├── test_main.py           # Suite de tests
     ├── conftest.py            # Fixtures

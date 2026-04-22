@@ -1,15 +1,27 @@
-#!/bin/sh
-set -eu
+#!/bin/bash
+set -e
 
 echo "Arrancando update-manager..."
 
-echo "DEV_ROS_DOMAIN_ID: ${DEV_ROS_DOMAIN_ID:-9}"
-echo "DEV_CYCLONEDDS_NETWORK_INTERFACE: ${DEV_CYCLONEDDS_NETWORK_INTERFACE:-eth0}"
+# Usamos el valor de la variable de Balena, o 'eth0' por defecto si no existe
+INTERFACE=${CYCLONEDDS_NETWORK_INTERFACE:-eth0}
 
-export ROS_DOMAIN_ID="${DEV_ROS_DOMAIN_ID:-9}"
-export CYCLONEDDS_NETWORK_INTERFACE="${DEV_CYCLONEDDS_NETWORK_INTERFACE:-eth0}"
+# Escribimos el XML dinámicamente
+echo "Configurando CycloneDDS para la interfaz: $INTERFACE"
 
-echo "ROS_DOMAIN_ID: ${ROS_DOMAIN_ID}"
-echo "CYCLONEDDS_NETWORK_INTERFACE: ${CYCLONEDDS_NETWORK_INTERFACE}"
+# Escribimos el XML dinámicamente
+echo "<CycloneDDS>
+  <Domain>
+    <General>
+      <Interfaces>
+        <NetworkInterface name=\"$INTERFACE\" />
+      </Interfaces>
+    </General>
+  </Domain>
+</CycloneDDS>" > /root/cyclonedds.config.xml
 
-exec python3 -u /app/main.py
+set +u
+source /opt/ros/humble/setup.bash
+set -u
+
+exec python3 -u /app/update_manager/main.py

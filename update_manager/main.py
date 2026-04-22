@@ -11,14 +11,8 @@ from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from rclpy.executors import ExternalShutdownException
 from std_msgs.msg import UInt16, Bool
+from std_srvs.srv import Trigger
 from lockfile import LockFile, AlreadyLocked, NotLocked, NotMyLock
-
-GetUpdateState = None
-try:
-    from update_manager.srv import GetUpdateState
-except (ImportError, ModuleNotFoundError):
-    # Service not available - likely running in test mode without compiled interfaces
-    pass
 
 BALENA_SUPERVISOR_ADDRESS = os.getenv("BALENA_SUPERVISOR_ADDRESS")
 BALENA_SUPERVISOR_API_KEY = os.getenv("BALENA_SUPERVISOR_API_KEY")
@@ -39,7 +33,7 @@ if not BALENA_SUPERVISOR_ADDRESS or not BALENA_SUPERVISOR_API_KEY:
 os.makedirs(os.path.dirname(LOCK_PATH), exist_ok=True)
 
 lock = LockFile(LOCK_PATH)
-state_lock = threading.Lock()
+state_lock = threading.RLock()  # RLock para permitir múltiples adquisiciones del mismo thread
 running = threading.Event()
 running.set()
 
@@ -62,44 +56,50 @@ logger = logging.getLogger(__name__)
 class UpdateManagerNode(Node):
     def __init__(self):
         super().__init__("update_manager")
+        logger.info("UpdateManagerNode inicializado")
 
+        logger.info("Creando subscriber /state (UInt16)")
         self.state_sub = self.create_subscription(
             UInt16,
             "/state",
             self.state_callback,
             10,
         )
+        logger.info("Subscriber /state creado exitosamente")
 
+        logger.info("Creando subscriber /update_allowed (Bool)")
         self.update_allow_sub = self.create_subscription(
             Bool,
             "/update_allowed",
             self.update_allowed_callback,
             10,
         )
+        logger.info("Subscriber /update_allowed creado exitosamente")
 
+        logger.info("Configurando QoS profile")
         qos_profile = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
+        logger.info("QoS profile configurado")
 
+        logger.info("Creando publisher /update_pending (Bool)")
         self.update_pending_pub = self.create_publisher(
             Bool,
             "/update_pending",
             qos_profile,
         )
+        logger.info("Publisher /update_pending creado exitosamente")
 
-        # Create service server for querying update state
-        if GetUpdateState is not None:
-            self.get_update_state_srv = self.create_service(
-                GetUpdateState,
-                "/get_update_state",
-                self.get_update_state_callback,
-            )
-            logger.info("Servicio /get_update_state disponible")
-        else:
-            logger.warning("GetUpdateState service interface not available")
+        logger.info("Creando servicio /get_update_state (std_srvs/Trigger)")
+        self.get_update_state_srv = self.create_service(
+            Trigger,
+            "/get_update_state",
+            self.get_update_state_callback,
+        )
+        logger.info("Servicio /get_update_state disponible (std_srvs/Trigger)")
 
     def state_callback(self, msg: UInt16):
         global robot_state
@@ -144,19 +144,27 @@ class UpdateManagerNode(Node):
             logger.warning("Error al publicar update_pending: %s", e)
 
     def get_update_state_callback(self, request, response):
-        """Service callback to query the current update pending state."""
+        """Service callback to query the current update pending state using std_srvs/Trigger."""
+        logger.info("Llamada al servicio /get_update_state recibida")
         try:
             with state_lock:
-                response.update_pending = waiting_for_update
-            logger.info("Servicio /get_update_state consultado: %s", response.update_pending)
+                pending = waiting_for_update
+            
+            response.success = pending
+            response.message = "Update pending" if pending else "No update pending"
+            logger.info(
+                "Servicio /get_update_state respondido: pending=%s", 
+                pending
+            )
         except Exception as e:
             logger.error("Error en get_update_state_callback: %s", e)
-            response.update_pending = False
+            response.success = False
+            response.message = "Error retrieving update state"
         
         return response
 
-
 def acquire_lock() -> bool:
+    logger.info("Intentando adquirir lock en %s", LOCK_PATH)
     with state_lock:
         try:
             lock.acquire(timeout=0)
@@ -208,8 +216,8 @@ def evaluate_unlock_condition():
         and current_locked
     ):
         logger.info("Condicion de desbloqueo cumplida, liberando lock")
-        release_lock()
-
+        if release_lock():
+            notify_supervisor_update_allowed()
 
 def fetch_device_state():
     url = (
@@ -223,30 +231,77 @@ def fetch_device_state():
         headers={"Content-Type": "application/json"},
     )
 
-    with request.urlopen(req, timeout=5) as response:
-        body = response.read().decode("utf-8")
-        return json.loads(body)
+    try:
+        with request.urlopen(req, timeout=5) as response:
+            body = response.read().decode("utf-8")
+            
+            if not body:
+                logger.warning("Respuesta vacía del supervisor en /v1/device")
+                return {}
+            
+            logger.debug("Respuesta del supervisor: %s", body)
+            return json.loads(body)
+    except json.JSONDecodeError as e:
+        logger.error("Error parsing JSON de respuesta del supervisor: %s (contenido: %s)", e, body if body else "vacío")
+        raise
+    except Exception as e:
+        logger.error("Error fetching device state: %s", e)
+        raise
 
 def ensure_lock_owned():
+    logger.info("Asegurando propiedad del lock en %s", LOCK_PATH)
     with state_lock:
         if lock.is_locked():
-            logger.info("Existe lock previo; reclamándolo para esta instancia")
+            logger.info("Existe lock previo; reclamandolo para esta instancia")
             try:
                 lock.break_lock()
             except Exception as e:
                 logger.warning("No se pudo romper lock previo: %s", e)
 
-        try:
-            lock.acquire(timeout=0)
-            logger.info("Lock adquirido por esta instancia")
-            return True
-        except AlreadyLocked:
-            logger.info("No se pudo adquirir lock; sigue existiendo")
-            return False
+        return acquire_lock()
+    
+def notify_supervisor_update_allowed():
+    logger.info("Solicitando actualizacion a traves del supervisor")
+    url = (
+        f"{BALENA_SUPERVISOR_ADDRESS}/v1/update"
+        f"?apikey={BALENA_SUPERVISOR_API_KEY}"
+    )
 
+    body = json.dumps({"force": False, "cancel": True}).encode("utf-8")
+    
+    req = request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+
+    try:
+        with request.urlopen(req, timeout=5) as response:
+            response_body = response.read().decode("utf-8")
+            result = json.loads(response_body)
+            logger.info("Respuesta del supervisor: %s", result)
+            return result
+    except Exception as e:
+        logger.error("Error al notificar al supervisor: %s", e)
+        raise
+    
 def start_ros2():
-    rclpy.init()
-    node = UpdateManagerNode()
+    logger.info("Inicializando ROS2...")
+    try:
+        rclpy.init()
+        logger.info("rclpy.init() completado")
+    except Exception as e:
+        logger.error("Error en rclpy.init(): %s", e)
+        raise
+    
+    logger.info("Creando nodo UpdateManagerNode...")
+    try:
+        node = UpdateManagerNode()
+        logger.info("UpdateManagerNode creado exitosamente")
+    except Exception as e:
+        logger.error("Error al crear UpdateManagerNode: %s", e)
+        raise
 
     def spin():
         try:
@@ -259,9 +314,10 @@ def start_ros2():
         except Exception as e:
             logger.error("Error en ROS2 spin thread: %s", e)
 
+    logger.info("Iniciando thread de spin de ROS2...")
     ros_thread = threading.Thread(target=spin, daemon=True)
     ros_thread.start()
-    logger.info("ROS2 iniciado")
+    logger.info("ROS2 iniciado exitosamente")
     return node, ros_thread
 
 def is_waiting_for_update(device_state: dict) -> bool:
@@ -279,12 +335,20 @@ def is_waiting_for_update(device_state: dict) -> bool:
 def main():
     global waiting_for_update, lock_released_for_update, update_allowed
 
+    logger.info("=== INICIANDO UPDATE MANAGER ===")
+    
+    logger.info("Paso 1: Iniciando ROS2")
     node, ros_thread = start_ros2()
+    logger.info("Paso 1: ROS2 iniciado exitosamente")
+    
+    logger.info("Paso 2: Asegurando propiedad del lock")
     ensure_lock_owned()
+    logger.info("Paso 2: Lock asegurado")
 
     previous_waiting = None
 
     try:
+        logger.info("Paso 3: Iniciando loop principal")
         while running.is_set():
             try:
                 data = fetch_device_state()
@@ -328,6 +392,7 @@ def main():
             time.sleep(POLL_INTERVAL)
 
     finally:
+        logger.info("Shutdown iniciado")
         running.clear()
         ros_thread.join(timeout=2)
         try:

@@ -5,6 +5,8 @@ services:
     build: .
     restart: unless-stopped
     network_mode: host
+    environment:
+      - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 
     labels:
       io.balena.features.supervisor-api: "1"
