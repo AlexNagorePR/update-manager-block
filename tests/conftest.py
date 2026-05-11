@@ -59,7 +59,6 @@ def reset_globals():
         main_module.waiting_for_update = False
         main_module.update_allowed = False
         main_module.robot_state = -1
-        main_module.lock_released_for_update = False
 
 
 @pytest.fixture
@@ -70,4 +69,3 @@ def mock_rclpy_node():
         # Mock the Node class creation
         with patch('rclpy.node.Node.__init__', return_value=None):
             yield mock_init
-

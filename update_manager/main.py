@@ -40,7 +40,6 @@ running.set()
 waiting_for_update = False
 update_allowed = False
 robot_state = -1
-lock_released_for_update = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -176,12 +175,9 @@ def acquire_lock() -> bool:
 
 
 def release_lock() -> bool:
-    global lock_released_for_update
-
     with state_lock:
         try:
             lock.release()
-            lock_released_for_update = True
             logger.info("Lock liberado en %s", LOCK_PATH)
             return True
         except NotLocked:
@@ -224,6 +220,7 @@ def fetch_device_state():
         f"{BALENA_SUPERVISOR_ADDRESS}/v1/device"
         f"?apikey={BALENA_SUPERVISOR_API_KEY}"
     )
+    body = ""
 
     req = request.Request(
         url,
@@ -332,20 +329,43 @@ def is_waiting_for_update(device_state: dict) -> bool:
         and bool(device_state.get("update_failed", False))
     )
 
+
+def reacquire_lock_if_update_finished(
+    previous_waiting: bool,
+    waiting: bool,
+) -> bool:
+    global update_allowed
+
+    if not (previous_waiting and not waiting):
+        return False
+
+    if is_locked():
+        return False
+
+    logger.info("Update terminada; reintentando adquirir lock")
+    acquired = acquire_lock()
+    if acquired:
+        with state_lock:
+            update_allowed = False
+        logger.info("update_allowed reseteado a %s", update_allowed)
+
+    return acquired
+
+
 def main():
-    global waiting_for_update, lock_released_for_update, update_allowed
+    global waiting_for_update, update_allowed
 
     logger.info("=== INICIANDO UPDATE MANAGER ===")
     
     logger.info("Paso 1: Iniciando ROS2")
     node, ros_thread = start_ros2()
     logger.info("Paso 1: ROS2 iniciado exitosamente")
-    
+
     logger.info("Paso 2: Asegurando propiedad del lock")
     ensure_lock_owned()
     logger.info("Paso 2: Lock asegurado")
 
-    previous_waiting = None
+    previous_waiting = False
 
     try:
         logger.info("Paso 3: Iniciando loop principal")
@@ -357,24 +377,19 @@ def main():
 
                 with state_lock:
                     waiting_for_update = waiting
-                    current_lock_released = lock_released_for_update
 
                 if waiting != previous_waiting:
                     logger.info("Waiting cambiado: %s -> %s", previous_waiting, waiting)
-
-                    if (
-                        previous_waiting == True
-                        and waiting == False
-                        and current_lock_released
-                        and not is_locked()
-                    ):
-                        logger.info("Update terminada; reintentando adquirir lock")
-                        acquired = acquire_lock()
-                        if acquired:
-                            with state_lock:
-                                lock_released_for_update = False
-                                update_allowed = False
-                            logger.info("update_allowed reseteado a %s", update_allowed)
+                    logger.info(
+                        "Estado actual: previous_waiting=%s, waiting=%s, is_locked=%s",
+                        previous_waiting,
+                        waiting,
+                        is_locked(),
+                    )
+                    reacquire_lock_if_update_finished(
+                        previous_waiting,
+                        waiting,
+                    )
 
                     previous_waiting = waiting
 

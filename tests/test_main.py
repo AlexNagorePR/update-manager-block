@@ -238,6 +238,63 @@ class TestUnlockCondition:
             mock_lock.release.assert_not_called()
 
 
+class TestUpdateCompletionLockRecovery:
+    """Tests for recovering lock ownership after an update finishes."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, env_vars, mock_lock, reset_globals):
+        """Setup for each test."""
+        pass
+
+    def test_reacquires_lock_when_update_finishes_and_lock_is_free(self, mock_lock):
+        """The observed lock state determines whether recovery is needed."""
+        import update_manager.main as main
+
+        with patch('update_manager.main.lock', mock_lock):
+            mock_lock.is_locked.return_value = False
+            mock_lock.acquire.return_value = None
+            main.update_allowed = True
+
+            result = main.reacquire_lock_if_update_finished(
+                previous_waiting=True,
+                waiting=False,
+            )
+
+            assert result is True
+            mock_lock.acquire.assert_called_once_with(timeout=0)
+            assert main.update_allowed is False
+
+    def test_does_not_reacquire_when_update_is_still_waiting(self, mock_lock):
+        """No recovery is attempted until waiting transitions to false."""
+        import update_manager.main as main
+
+        with patch('update_manager.main.lock', mock_lock):
+            mock_lock.is_locked.return_value = False
+
+            result = main.reacquire_lock_if_update_finished(
+                previous_waiting=True,
+                waiting=True,
+            )
+
+            assert result is False
+            mock_lock.acquire.assert_not_called()
+
+    def test_does_not_reacquire_when_lock_exists(self, mock_lock):
+        """If some process still owns a lock, leave it alone."""
+        import update_manager.main as main
+
+        with patch('update_manager.main.lock', mock_lock):
+            mock_lock.is_locked.return_value = True
+
+            result = main.reacquire_lock_if_update_finished(
+                previous_waiting=True,
+                waiting=False,
+            )
+
+            assert result is False
+            mock_lock.acquire.assert_not_called()
+
+
 class TestFetchDeviceState:
     """Tests for fetching device state from supervisor."""
 
@@ -548,4 +605,3 @@ class TestNotifySupervisor:
                 main.notify_supervisor_update_allowed()
             
             assert "Network error" in str(exc_info.value)
-
